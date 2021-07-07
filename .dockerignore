@@ -11,3 +11,5 @@ phpcs.xml
 phpcs.xml
 scalingo.json
 tests/*
+bridges/*
+!bridges/NJPWWorldBridge.php
