@@ -1,213 +1,222 @@
 <?php
-/**
- * This file is part of RSS-Bridge, a PHP project capable of generating RSS and
- * Atom feeds for websites that don't have one.
- *
- * For the full license information, please view the UNLICENSE file distributed
- * with this source code.
- *
- * @package	Core
- * @license	http://unlicense.org/ UNLICENSE
- * @link	https://github.com/rss-bridge/rss-bridge
- */
+
+final class HttpException extends \Exception
+{
+}
+
+// todo: move this somewhere useful, possibly into a function
+const RSSBRIDGE_HTTP_STATUS_CODES = [
+    '100' => 'Continue',
+    '101' => 'Switching Protocols',
+    '200' => 'OK',
+    '201' => 'Created',
+    '202' => 'Accepted',
+    '203' => 'Non-Authoritative Information',
+    '204' => 'No Content',
+    '205' => 'Reset Content',
+    '206' => 'Partial Content',
+    '300' => 'Multiple Choices',
+    '302' => 'Found',
+    '303' => 'See Other',
+    '304' => 'Not Modified',
+    '305' => 'Use Proxy',
+    '400' => 'Bad Request',
+    '401' => 'Unauthorized',
+    '402' => 'Payment Required',
+    '403' => 'Forbidden',
+    '404' => 'Not Found',
+    '405' => 'Method Not Allowed',
+    '406' => 'Not Acceptable',
+    '407' => 'Proxy Authentication Required',
+    '408' => 'Request Timeout',
+    '409' => 'Conflict',
+    '410' => 'Gone',
+    '411' => 'Length Required',
+    '412' => 'Precondition Failed',
+    '413' => 'Request Entity Too Large',
+    '414' => 'Request-URI Too Long',
+    '415' => 'Unsupported Media Type',
+    '416' => 'Requested Range Not Satisfiable',
+    '417' => 'Expectation Failed',
+    '429' => 'Too Many Requests',
+    '500' => 'Internal Server Error',
+    '501' => 'Not Implemented',
+    '502' => 'Bad Gateway',
+    '503' => 'Service Unavailable',
+    '504' => 'Gateway Timeout',
+    '505' => 'HTTP Version Not Supported'
+];
 
 /**
- * Gets contents from the Internet.
+ * Fetch data from an http url
  *
- * **Content caching** (disabled in debug mode)
- *
- * A copy of the received content is stored in a local cache folder `server/` at
- * {@see PATH_CACHE}. The `If-Modified-Since` header is added to the request, if
- * the provided URL has been cached before.
- *
- * When the server responds with `304 Not Modified`, the cached data is returned.
- * This will improve response times and reduce bandwidth for servers that support
- * the `If-Modified-Since` header.
- *
- * Cached files are forcefully removed after 24 hours.
- *
- * @link https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/If-Modified-Since
- * If-Modified-Since
- *
- * @param string $url The URL.
- * @param array $header (optional) A list of cURL header.
- * For more information follow the links below.
- * * https://php.net/manual/en/function.curl-setopt.php
- * * https://curl.haxx.se/libcurl/c/CURLOPT_HTTPHEADER.html
- * @param array $opts (optional) A list of cURL options as associative array in
- * the format `$opts[$option] = $value;`, where `$option` is any `CURLOPT_XXX`
- * option and `$value` the corresponding value.
- * @param bool $returnHeader Returns an array of two elements 'header' and
- * 'content' if enabled.
- *
- * For more information see http://php.net/manual/en/function.curl-setopt.php
- * @return string|array The contents.
+ * @param array $httpHeaders E.g. ['Content-type: text/plain']
+ * @param array $curlOptions Associative array e.g. [CURLOPT_MAXREDIRS => 3]
+ * @param bool $returnFull Whether to return an array:
+ *                         [
+ *                              'code' => int,
+ *                              'header' => array,
+ *                              'content' => string,
+ *                              'status_lines' => array,
+ *                         ]
+
+ * @return string|array
  */
-function getContents($url, $header = array(), $opts = array(), $returnHeader = false){
-	Debug::log('Reading contents from "' . $url . '"');
+function getContents(
+    string $url,
+    array $httpHeaders = [],
+    array $curlOptions = [],
+    bool $returnFull = false
+) {
+    $cacheFactory = new CacheFactory();
 
-	// Initialize cache
-	$cacheFac = new CacheFactory();
-	$cacheFac->setWorkingDir(PATH_LIB_CACHES);
-	$cache = $cacheFac->create(Configuration::getConfig('cache', 'type'));
-	$cache->setScope('server');
-	$cache->purgeCache(86400); // 24 hours (forced)
+    $cache = $cacheFactory->create();
+    $cache->setScope('server');
+    $cache->purgeCache(86400); // 24 hours (forced)
+    $cache->setKey([$url]);
 
-	$params = array($url);
-	$cache->setKey($params);
+    $config = [
+        'headers' => $httpHeaders,
+        'curl_options' => $curlOptions,
+    ];
+    if (defined('PROXY_URL') && !defined('NOPROXY')) {
+        $config['proxy'] = PROXY_URL;
+    }
+    if (!Debug::isEnabled() && $cache->getTime()) {
+        $config['if_not_modified_since'] = $cache->getTime();
+    }
 
-	$retVal = array(
-		'header' => '',
-		'content' => '',
-	);
+    $result = _http_request($url, $config);
+    $response = [
+        'code' => $result['code'],
+        'status_lines' => $result['status_lines'],
+        'header' => $result['headers'],
+        'content' => $result['body'],
+    ];
 
-	// Use file_get_contents if in CLI mode with no root certificates defined
-	if(php_sapi_name() === 'cli' && empty(ini_get('curl.cainfo'))) {
+    switch ($result['code']) {
+        case 200:
+        case 201:
+        case 202:
+            if (isset($result['headers']['cache-control'])) {
+                $cachecontrol = $result['headers']['cache-control'];
+                $lastValue = array_pop($cachecontrol);
+                $directives = explode(',', $lastValue);
+                $directives = array_map('trim', $directives);
+                if (in_array('no-cache', $directives) || in_array('no-store', $directives)) {
+                    // Don't cache as instructed by the server
+                    break;
+                }
+            }
+            $cache->saveData($result['body']);
+            break;
+        case 304: // Not Modified
+            $response['content'] = $cache->loadData();
+            break;
+        default:
+            throw new HttpException(
+                sprintf(
+                    '%s %s',
+                    $result['code'],
+                    RSSBRIDGE_HTTP_STATUS_CODES[$result['code']] ?? ''
+                ),
+                $result['code']
+            );
+    }
+    if ($returnFull === true) {
+        return $response;
+    }
+    return $response['content'];
+}
 
-		$httpHeaders = '';
+/**
+ * Private function used internally
+ *
+ * Fetch content from url
+ *
+ * @throws HttpException
+ */
+function _http_request(string $url, array $config = []): array
+{
+    $defaults = [
+        'useragent' => Configuration::getConfig('http', 'useragent'),
+        'timeout' => Configuration::getConfig('http', 'timeout'),
+        'headers' => [],
+        'proxy' => null,
+        'curl_options' => [],
+        'if_not_modified_since' => null,
+        'retries' => 3,
+    ];
+    $config = array_merge($defaults, $config);
 
-		foreach ($header as $headerL) {
-			$httpHeaders .= $headerL . "\r\n";
-		}
+    $ch = curl_init($url);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
+    curl_setopt($ch, CURLOPT_MAXREDIRS, 5);
+    curl_setopt($ch, CURLOPT_HEADER, false);
+    curl_setopt($ch, CURLOPT_HTTPHEADER, $config['headers']);
+    curl_setopt($ch, CURLOPT_USERAGENT, $config['useragent']);
+    curl_setopt($ch, CURLOPT_TIMEOUT, $config['timeout']);
+    curl_setopt($ch, CURLOPT_ENCODING, '');
+    curl_setopt($ch, CURLOPT_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
+    if ($config['proxy']) {
+        curl_setopt($ch, CURLOPT_PROXY, $config['proxy']);
+    }
+    if (curl_setopt_array($ch, $config['curl_options']) === false) {
+        throw new \Exception('Tried to set an illegal curl option');
+    }
 
-		$ctx = stream_context_create(array(
-			'http' => array(
-				'header' => $httpHeaders
-			)
-		));
+    if ($config['if_not_modified_since']) {
+        curl_setopt($ch, CURLOPT_TIMEVALUE, $config['if_not_modified_since']);
+        curl_setopt($ch, CURLOPT_TIMECONDITION, CURL_TIMECOND_IFMODSINCE);
+    }
 
-		$data = @file_get_contents($url, 0, $ctx);
+    $responseStatusLines = [];
+    $responseHeaders = [];
+    curl_setopt($ch, CURLOPT_HEADERFUNCTION, function ($ch, $rawHeader) use (&$responseHeaders, &$responseStatusLines) {
+        $len = strlen($rawHeader);
+        if ($rawHeader === "\r\n") {
+            return $len;
+        }
+        if (preg_match('#^HTTP/(2|1.1|1.0)#', $rawHeader)) {
+            $responseStatusLines[] = $rawHeader;
+            return $len;
+        }
+        $header = explode(':', $rawHeader);
+        if (count($header) === 1) {
+            return $len;
+        }
+        $name = mb_strtolower(trim($header[0]));
+        $value = trim(implode(':', array_slice($header, 1)));
+        if (!isset($responseHeaders[$name])) {
+            $responseHeaders[$name] = [];
+        }
+        $responseHeaders[$name][] = $value;
+        return $len;
+    });
 
-		if($data === false) {
-			$errorCode = 500;
-		} else {
-			$errorCode = 200;
-			$retVal['header'] = implode("\r\n", $http_response_header);
-		}
+    $attempts = 0;
+    while (true) {
+        $attempts++;
+        $data = curl_exec($ch);
+        if ($data !== false) {
+            // The network call was successful, so break out of the loop
+            break;
+        }
+        if ($attempts > $config['retries']) {
+            // Finally give up
+            throw new HttpException(sprintf('%s (%s)', curl_error($ch), curl_errno($ch)));
+        }
+    }
 
-		$curlError = '';
-		$curlErrno = '';
-		$headerSize = 0;
-		$finalHeader = array();
-	} else {
-		$ch = curl_init($url);
-		curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-		curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
-
-		if(is_array($header) && count($header) !== 0) {
-
-			Debug::log('Setting headers: ' . json_encode($header));
-			curl_setopt($ch, CURLOPT_HTTPHEADER, $header);
-
-		}
-
-		curl_setopt($ch, CURLOPT_USERAGENT, ini_get('user_agent'));
-		curl_setopt($ch, CURLOPT_ENCODING, '');
-		curl_setopt($ch, CURLOPT_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
-
-		if(is_array($opts) && count($opts) !== 0) {
-
-			Debug::log('Setting options: ' . json_encode($opts));
-
-			foreach($opts as $key => $value) {
-				curl_setopt($ch, $key, $value);
-			}
-
-		}
-
-		if(defined('PROXY_URL') && !defined('NOPROXY')) {
-
-			Debug::log('Setting proxy url: ' . PROXY_URL);
-			curl_setopt($ch, CURLOPT_PROXY, PROXY_URL);
-
-		}
-
-		// We always want the response header as part of the data!
-		curl_setopt($ch, CURLOPT_HEADER, true);
-
-		// Build "If-Modified-Since" header
-		if(!Debug::isEnabled() && $time = $cache->getTime()) { // Skip if cache file doesn't exist
-			Debug::log('Adding If-Modified-Since');
-			curl_setopt($ch, CURLOPT_TIMEVALUE, $time);
-			curl_setopt($ch, CURLOPT_TIMECONDITION, CURL_TIMECOND_IFMODSINCE);
-		}
-
-		// Enables logging for the outgoing header
-		curl_setopt($ch, CURLINFO_HEADER_OUT, true);
-
-		$data = curl_exec($ch);
-		$errorCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-
-		$curlError = curl_error($ch);
-		$curlErrno = curl_errno($ch);
-		$curlInfo = curl_getinfo($ch);
-
-		Debug::log('Outgoing header: ' . json_encode($curlInfo));
-
-		if($data === false)
-			Debug::log('Cant\'t download ' . $url . ' cUrl error: ' . $curlError . ' (' . $curlErrno . ')');
-
-		$headerSize = curl_getinfo($ch, CURLINFO_HEADER_SIZE);
-		$header = substr($data, 0, $headerSize);
-		$retVal['header'] = $header;
-
-		Debug::log('Response header: ' . $header);
-
-		$headers = parseResponseHeader($header);
-		$finalHeader = end($headers);
-
-		curl_close($ch);
-	}
-
-	switch($errorCode) {
-		case 200: // Contents OK
-		case 201: // Contents Created
-		case 202: // Contents Accepted
-			Debug::log('New contents received');
-			$data = substr($data, $headerSize);
-			// Disable caching if the server responds with "Cache-Control: no-cache"
-			// or "Cache-Control: no-store"
-			$finalHeader = array_change_key_case($finalHeader, CASE_LOWER);
-			if(array_key_exists('cache-control', $finalHeader)) {
-				Debug::log('Server responded with "Cache-Control" header');
-				$directives = explode(',', $finalHeader['cache-control']);
-				$directives = array_map('trim', $directives);
-				if(in_array('no-cache', $directives)
-				|| in_array('no-store', $directives)) { // Skip caching
-					Debug::log('Skip server side caching');
-					$retVal['content'] = $data;
-					break;
-				}
-			}
-			Debug::log('Store response to cache');
-			$cache->saveData($data);
-			$retVal['content'] = $data;
-			break;
-		case 304: // Not modified, use cached data
-			Debug::log('Contents not modified on host, returning cached data');
-			$retVal['content'] = $cache->loadData();
-			break;
-		default:
-			if(array_key_exists('Server', $finalHeader) && strpos($finalHeader['Server'], 'cloudflare') !== false) {
-			returnServerError(<<< EOD
-The server responded with a Cloudflare challenge, which is not supported by RSS-Bridge!
-If this error persists longer than a week, please consider opening an issue on GitHub!
-EOD
-				);
-			}
-
-			$lastError = error_get_last();
-			if($lastError !== null)
-				$lastError = $lastError['message'];
-			returnError(<<<EOD
-Unexpected response from upstream.
-cUrl error: $curlError ($curlErrno)
-PHP error: $lastError
-EOD
-			, $errorCode);
-	}
-
-	return ($returnHeader === true) ? $retVal : $retVal['content'];
+    $statusCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+    return [
+        'code'      => $statusCode,
+        'status_lines' => $responseStatusLines,
+        'headers'   => $responseHeaders,
+        'body'      => $data,
+    ];
 }
 
 /**
@@ -236,24 +245,31 @@ EOD
  * tags when returning plaintext.
  * @return false|simple_html_dom Contents as simplehtmldom object.
  */
-function getSimpleHTMLDOM($url,
-	$header = array(),
-	$opts = array(),
-	$lowercase = true,
-	$forceTagsClosed = true,
-	$target_charset = DEFAULT_TARGET_CHARSET,
-	$stripRN = true,
-	$defaultBRText = DEFAULT_BR_TEXT,
-	$defaultSpanText = DEFAULT_SPAN_TEXT){
-
-	$content = getContents($url, $header, $opts);
-	return str_get_html($content,
-	$lowercase,
-	$forceTagsClosed,
-	$target_charset,
-	$stripRN,
-	$defaultBRText,
-	$defaultSpanText);
+function getSimpleHTMLDOM(
+    $url,
+    $header = [],
+    $opts = [],
+    $lowercase = true,
+    $forceTagsClosed = true,
+    $target_charset = DEFAULT_TARGET_CHARSET,
+    $stripRN = true,
+    $defaultBRText = DEFAULT_BR_TEXT,
+    $defaultSpanText = DEFAULT_SPAN_TEXT
+) {
+    $content = getContents(
+        $url,
+        $header ?? [],
+        $opts ?? []
+    );
+    return str_get_html(
+        $content,
+        $lowercase,
+        $forceTagsClosed,
+        $target_charset,
+        $stripRN,
+        $defaultBRText,
+        $defaultSpanText
+    );
 }
 
 /**
@@ -286,87 +302,58 @@ function getSimpleHTMLDOM($url,
  * tags when returning plaintext.
  * @return false|simple_html_dom Contents as simplehtmldom object.
  */
-function getSimpleHTMLDOMCached($url,
-	$duration = 86400,
-	$header = array(),
-	$opts = array(),
-	$lowercase = true,
-	$forceTagsClosed = true,
-	$target_charset = DEFAULT_TARGET_CHARSET,
-	$stripRN = true,
-	$defaultBRText = DEFAULT_BR_TEXT,
-	$defaultSpanText = DEFAULT_SPAN_TEXT){
+function getSimpleHTMLDOMCached(
+    $url,
+    $duration = 86400,
+    $header = [],
+    $opts = [],
+    $lowercase = true,
+    $forceTagsClosed = true,
+    $target_charset = DEFAULT_TARGET_CHARSET,
+    $stripRN = true,
+    $defaultBRText = DEFAULT_BR_TEXT,
+    $defaultSpanText = DEFAULT_SPAN_TEXT
+) {
+    Debug::log('Caching url ' . $url . ', duration ' . $duration);
 
-	Debug::log('Caching url ' . $url . ', duration ' . $duration);
+    // Initialize cache
+    $cacheFactory = new CacheFactory();
 
-	// Initialize cache
-	$cacheFac = new CacheFactory();
-	$cacheFac->setWorkingDir(PATH_LIB_CACHES);
-	$cache = $cacheFac->create(Configuration::getConfig('cache', 'type'));
-	$cache->setScope('pages');
-	$cache->purgeCache(86400); // 24 hours (forced)
+    $cache = $cacheFactory->create();
+    $cache->setScope('pages');
+    $cache->purgeCache(86400); // 24 hours (forced)
 
-	$params = array($url);
-	$cache->setKey($params);
+    $params = [$url];
+    $cache->setKey($params);
 
-	// Determine if cached file is within duration
-	$time = $cache->getTime();
-	if($time !== false
-	&& (time() - $duration < $time)
-	&& !Debug::isEnabled()) { // Contents within duration
-		$content = $cache->loadData();
-	} else { // Content not within duration
-		$content = getContents($url, $header, $opts);
-		if($content !== false) {
-			$cache->saveData($content);
-		}
-	}
+    // Determine if cached file is within duration
+    $time = $cache->getTime();
+    if (
+        $time !== false
+        && (time() - $duration < $time)
+        && !Debug::isEnabled()
+    ) { // Contents within duration
+        $content = $cache->loadData();
+    } else { // Content not within duration
+        $content = getContents(
+            $url,
+            $header ?? [],
+            $opts ?? []
+        );
+        if ($content !== false) {
+            $cache->saveData($content);
+        }
+    }
 
-	return str_get_html($content,
-	$lowercase,
-	$forceTagsClosed,
-	$target_charset,
-	$stripRN,
-	$defaultBRText,
-	$defaultSpanText);
-}
-
-/**
- * Parses the cURL response header into an associative array
- *
- * Based on https://stackoverflow.com/a/18682872
- *
- * @param string $header The cURL response header.
- * @return array An associative array of response headers.
- */
-function parseResponseHeader($header) {
-
-	$headers = array();
-	$requests = explode("\r\n\r\n", trim($header));
-
-	foreach ($requests as $request) {
-
-		$header = array();
-
-		foreach (explode("\r\n", $request) as $i => $line) {
-
-			if($i === 0) {
-				$header['http_code'] = $line;
-			} else {
-
-				list ($key, $value) = explode(':', $line);
-				$header[$key] = trim($value);
-
-			}
-
-		}
-
-		$headers[] = $header;
-
-	}
-
-	return $headers;
-
+    return str_get_html(
+        $content,
+        $lowercase,
+        $forceTagsClosed,
+        $target_charset,
+        $stripRN,
+        $defaultBRText,
+        $defaultSpanText
+    );
 }
 
 /**
@@ -383,48 +370,53 @@ function parseResponseHeader($header) {
  * @param string $url The URL or path to the file.
  * @return string The MIME type of the file.
  */
-function getMimeType($url) {
-	static $mime = null;
+function getMimeType($url)
+{
+    static $mime = null;
 
-	if (is_null($mime)) {
-		// Default values, overriden by /etc/mime.types when present
-		$mime = array(
-			'jpg' => 'image/jpeg',
-			'gif' => 'image/gif',
-			'png' => 'image/png',
-			'image' => 'image/*'
-		);
-		// '@' is used to mute open_basedir warning, see issue #818
-		if (@is_readable('/etc/mime.types')) {
-			$file = fopen('/etc/mime.types', 'r');
-			while(($line = fgets($file)) !== false) {
-				$line = trim(preg_replace('/#.*/', '', $line));
-				if(!$line)
-					continue;
-				$parts = preg_split('/\s+/', $line);
-				if(count($parts) == 1)
-					continue;
-				$type = array_shift($parts);
-				foreach($parts as $part)
-					$mime[$part] = $type;
-			}
-			fclose($file);
-		}
-	}
+    if (is_null($mime)) {
+        // Default values, overriden by /etc/mime.types when present
+        $mime = [
+            'jpg' => 'image/jpeg',
+            'gif' => 'image/gif',
+            'png' => 'image/png',
+            'image' => 'image/*',
+            'mp3' => 'audio/mpeg',
+        ];
+        // '@' is used to mute open_basedir warning, see issue #818
+        if (@is_readable('/etc/mime.types')) {
+            $file = fopen('/etc/mime.types', 'r');
+            while (($line = fgets($file)) !== false) {
+                $line = trim(preg_replace('/#.*/', '', $line));
+                if (!$line) {
+                    continue;
+                }
+                $parts = preg_split('/\s+/', $line);
+                if (count($parts) == 1) {
+                    continue;
+                }
+                $type = array_shift($parts);
+                foreach ($parts as $part) {
+                    $mime[$part] = $type;
+                }
+            }
+            fclose($file);
+        }
+    }
 
-	if (strpos($url, '?') !== false) {
-		$url_temp = substr($url, 0, strpos($url, '?'));
-		if (strpos($url, '#') !== false) {
-			$anchor = substr($url, strpos($url, '#'));
-			$url_temp .= $anchor;
-		}
-		$url = $url_temp;
-	}
+    if (strpos($url, '?') !== false) {
+        $url_temp = substr($url, 0, strpos($url, '?'));
+        if (strpos($url, '#') !== false) {
+            $anchor = substr($url, strpos($url, '#'));
+            $url_temp .= $anchor;
+        }
+        $url = $url_temp;
+    }
 
-	$ext = strtolower(pathinfo($url, PATHINFO_EXTENSION));
-	if (!empty($mime[$ext])) {
-		return $mime[$ext];
-	}
+    $ext = strtolower(pathinfo($url, PATHINFO_EXTENSION));
+    if (!empty($mime[$ext])) {
+        return $mime[$ext];
+    }
 
-	return 'application/octet-stream';
+    return 'application/octet-stream';
 }
