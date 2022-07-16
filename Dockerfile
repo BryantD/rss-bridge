@@ -1,26 +1,23 @@
-ARG FROM_ARCH=amd64
-
-# Multi-stage build, see https://docs.docker.com/develop/develop-images/multistage-build/
-FROM alpine AS builder
-
-# Download QEMU
-ADD https://github.com/balena-io/qemu/releases/download/v5.2.0%2Bbalena4/qemu-5.2.0.balena4-arm.tar.gz .
-RUN tar zxvf qemu-5.2.0.balena4-arm.tar.gz --strip-components 1
-ADD https://github.com/balena-io/qemu/releases/download/v5.2.0%2Bbalena4/qemu-5.2.0.balena4-aarch64.tar.gz .
-RUN tar zxvf qemu-5.2.0.balena4-aarch64.tar.gz --strip-components 1
-
-FROM $FROM_ARCH/php:7-apache
+FROM php:7.4.29-fpm
 
 LABEL description="RSS-Bridge is a PHP project capable of generating RSS and Atom feeds for websites that don't have one."
 LABEL repository="https://github.com/RSS-Bridge/rss-bridge"
 LABEL website="https://github.com/RSS-Bridge/rss-bridge"
 
-# Add QEMU
-COPY --from=builder qemu-arm-static /usr/bin
-COPY --from=builder qemu-aarch64-static /usr/bin
+RUN apt-get update && \
+    apt-get install --yes --no-install-recommends \
+      nginx \
+      zlib1g-dev \
+      libzip-dev \
+      libmemcached-dev && \
+    docker-php-ext-install zip && \
+    pecl install memcached && \
+    docker-php-ext-enable memcached && \
+    mv "$PHP_INI_DIR/php.ini-production" "$PHP_INI_DIR/php.ini"
 
-ENV APACHE_DOCUMENT_ROOT=/app
+COPY ./config/nginx.conf /etc/nginx/sites-enabled/default
 
+<<<<<<< HEAD
 RUN mv "$PHP_INI_DIR/php.ini-production" "$PHP_INI_DIR/php.ini" \
 	&& apt-get --yes update \
 	&& apt-get --yes --no-install-recommends install \
@@ -32,3 +29,10 @@ RUN mv "$PHP_INI_DIR/php.ini-production" "$PHP_INI_DIR/php.ini" \
 	&& sed -ri -e 's/(CipherString\s*=\s*DEFAULT)@SECLEVEL=2/\1/' /etc/ssl/openssl.cnf
 
 COPY --chown=www-data:www-data ./ /app/
+=======
+COPY --chown=www-data:www-data ./ /app/
+
+EXPOSE 80
+
+ENTRYPOINT ["/app/docker-entrypoint.sh"]
+>>>>>>> fb091776c3d0ff2981ff486ae53f435259609280

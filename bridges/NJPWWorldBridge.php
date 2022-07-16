@@ -17,14 +17,36 @@ class NJPWWorldBridge extends BridgeAbstract {
                                 'required' => true,
                                 'title' => 'Language to use',
                                 'defaultValue' => 'en'
-                        )
+                        ),
+			'wrestler' => array(
+				'name' => 'wrestler',
+				'type' => 'list', 
+                                'values' => array(
+					'All' => false,
+					'Minoru Suzuki' 	=> 'man_282_en',
+                                        'Taichi' 		=> 'man_380_en',
+                                        'Zack Sabre Jr.'	=> 'man_546_en',
+					'El Desperado'		=> 'man_483_en',
+					'Yoshinobu Kanemaru'	=> 'man_677_en',
+					'DOUKI'			=> 'man_777_en',
+                                ),
+                                'required' => false,
+                                'title' => 'Wrestler search'
+			)
                 )
         );
 	const CACHE_TIMEOUT = 21600; // 6 hours
 
 	public function collectData() {
                 $lang = $this->getInput('lang');
-                $uri = self::URI . '/search/latest?lang=' . $lang . '#googtrans(' . $lang . ')';
+		$wrestler_tag = $this->getInput('wrestler');
+		if ($wrestler_tag) {
+			$uri = self::URI . '/search/tag/' . $wrestler_tag;
+		}
+		else {
+			$uri = self::URI . '/search/latest';
+		}
+		$uri .= '?lang=' . $lang . '#googtrans(' . $lang . ')';
 		$html = getSimpleHTMLDOM($uri)
 			or returnServerError('Could not request: ' . $url);
 
