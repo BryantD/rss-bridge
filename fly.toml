@@ -5,8 +5,8 @@ app = "weathered-dream-527"
 kill_signal = "SIGINT"
 kill_timeout = 5
 
-[build]
-  image = "rss-bridge"
+#[build]
+#  image = "rss-bridge"
 
 [env]
 
